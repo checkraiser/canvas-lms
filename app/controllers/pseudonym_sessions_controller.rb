@@ -15,13 +15,15 @@
 # You should have received a copy of the GNU Affero General Public License along
 # with this program. If not, see <http://www.gnu.org/licenses/>.
 #
+require 'rest_client'
+require 'json'
 
 class PseudonymSessionsController < ApplicationController
-  protect_from_forgery :except => [:create, :destroy, :saml_consume, :oauth2_token, :oauth2_logout]
+  protect_from_forgery :except => [:create, :destroy, :saml_consume, :oauth2_token]
   before_filter :forbid_on_files_domain, :except => [ :clear_file_session ]
   before_filter :require_password_session, :only => [ :otp_login, :disable_otp_login ]
   before_filter :require_user, :only => [ :otp_login ]
-
+  
   def new
     if @current_user && !params[:re_login] && !params[:confirm] && !params[:expected_user_id] && !session[:used_remember_me_token]
       redirect_to dashboard_url
@@ -61,9 +63,13 @@ class PseudonymSessionsController < ApplicationController
           return
         end
         if st.is_valid?
+	  ea = st.response.extra_attributes
+#	  st.response.extra_attributes.each do |k,v|
+	  
           @pseudonym = nil
           @pseudonym = @domain_root_account.pseudonyms.custom_find_by_unique_id(st.response.user)
-          if @pseudonym
+	#  if @pseudonym then puts "state: " + @pseudonym[:workflow_state] end
+          if @pseudonym and @pseudonym.workflow_state != 'deleted' then 
             # Successful login and we have a user
             @domain_root_account.pseudonym_sessions.create!(@pseudonym, false)
             session[:cas_login] = true
@@ -73,10 +79,67 @@ class PseudonymSessionsController < ApplicationController
             return
           else
             logger.warn "Received CAS login for unknown user: #{st.response.user}"
-            reset_session
-            session[:delegated_message] = t 'errors.no_matching_user', "Canvas doesn't have an account for user: %{user}", :user => st.response.user
-            redirect_to(cas_client.logout_url(cas_login_url :no_auto => true))
-            return
+
+	    if ea["status"].to_i == 0 then
+		reset_session
+		session[:delegated_message] = t 'errors.no_matching_user', "Canvas doesn't have an account for user: %{user}", :user => st.response.user
+		redirect_to(cas_client.logout_url(cas_login_url :no_auto => true ))
+		return
+	    end
+#            puts "Hovaten: " + st.response.extra_attributes[:hovaten]
+#	begin
+#	    auth_token="K7TosbeXDnmO3006zPLERvVl19L7SInv0NRp8RXkXbJ9dVeegZ0dOUt9e6GJ3yUb"	    
+#	    server = "http://el.hpu.edu.vn"
+	    
+#	    create_user_url = "#{server}/api/v1/accounts/4/users"
+#	    user_name = st.response.user
+#	    login_id = st.response.user
+#	    sis_user_id = st.response.user
+#	    params = {
+#		"user[name]" => "#{user_name}",
+#		"pseudonym[unique_id]" => "#{login_id}",
+#		"pseudonym[sis_user_id]" => "#{sis_user_id}",
+#		"pseudonym[send_confirmation]" => false
+#	    }
+#	    RestClient.post create_user_url, params, :Authorization => "Bearer #{auth_token}"
+	    @user = User.create! do |u|
+		 u.workflow_state = 'registered' 
+		 u.name = st.response.user
+	    end
+#	    u.name = st.response.user
+	    @pseudonym = @user.pseudonyms.create!(:unique_id => st.response.user,
+		:sis_user_id => st.response.user,
+		:send_confirmation => false)
+#	    if ea["role"].to_i == 1 then
+#		@pseudonym.sis_user_id = ea["masinhvien"]
+#		u.initial_enrollment_type = 'student'
+#	    else
+#		if ea["role"].to_i == 2 then
+#			u.initial_enrollment_type = 'teacher'
+#		end
+#		@pseudonym.sis_user_id = st.response.user
+#	    end
+#	    puts st.response.inspect
+	    begin 
+		@user.save!
+	        @pseudonym.save!   
+#		@pseudonym = @domain_root_account.pseudonyms.custom_find_by_unique_id(st.response.user)
+#		@domain_root_account.pseudonym_sessions.create!(@pseudonym, false)
+		session[:cas_login] = true
+		@user = @pseudonym.login_assertions_for_user
+		succesful_login(@user, @pseudonym)
+		return
+	    rescue 
+		redirect_to cas_login_url :no_auto => true
+		return 
+	    end
+            @user = @pseudonym.login_assertions_for_user
+ 	    successful_login(@user, @pseudonym)
+ 	    return
+      #      reset_session
+      #      session[:delegated_message] = t 'errors.no_matching_user', "Canvas doesn't have an account for user: %{user}", :user => st.response.user
+     #       redirect_to(cas_client.logout_url(cas_login_url :no_auto => true))
+     #       return
           end
         else
           logger.warn "Failed CAS login attempt."
@@ -575,38 +638,33 @@ class PseudonymSessionsController < ApplicationController
       return render()
     end
 
-    scopes =  params[:scopes].split(',') if params.key? :scopes
-    scopes ||= []
-
-    provider = Canvas::Oauth::Provider.new(params[:client_id], params[:redirect_uri], scopes)
+    provider = Canvas::Oauth::Provider.new(params[:client_id], params[:redirect_uri])
 
     return render(:status => 400, :json => { :message => "invalid client_id" }) unless provider.has_valid_key?
     return render(:status => 400, :json => { :message => "invalid redirect_uri" }) unless provider.has_valid_redirect?
     session[:oauth2] = provider.session_hash
-    session[:oauth2][:state] = params[:state] if params.key?(:state)
 
     if @current_pseudonym
-      if provider.authorized_token? @current_user
-        final_oauth2_redirect(session[:oauth2][:redirect_uri], final_oauth2_redirect_params)
-      elsif
-        redirect_to oauth2_auth_confirm_url
-      end
+      redirect_to oauth2_auth_confirm_url
     else
       redirect_to login_url(:canvas_login => params[:canvas_login])
     end
   end
 
   def oauth2_confirm
-    @provider = Canvas::Oauth::Provider.new(session[:oauth2][:client_id], session[:oauth2][:redirect_uri], session[:oauth2][:scopes])
+    @provider = Canvas::Oauth::Provider.new(session[:oauth2][:client_id])
   end
 
   def oauth2_accept
-    redirect_params = final_oauth2_redirect_params(:remember_access => params[:remember_access])
-    final_oauth2_redirect(session[:oauth2][:redirect_uri], redirect_params)
+    # now generate the temporary code, and respond/redirect
+    code = Canvas::Oauth::Token.generate_code_for(@current_user.global_id, session[:oauth2][:client_id])
+    final_oauth2_redirect(session[:oauth2][:redirect_uri], :code => code)
+    session.delete(:oauth2)
   end
 
   def oauth2_deny
     final_oauth2_redirect(session[:oauth2][:redirect_uri], :error => "access_denied")
+    session.delete(:oauth2)
   end
 
   def oauth2_token
@@ -622,8 +680,6 @@ class PseudonymSessionsController < ApplicationController
     token = provider.token_for(params[:code])
     return render(:status => 400, :json => { :message => "invalid code" }) unless token.is_for_valid_code?
 
-    Canvas::Oauth::Token.expire_code(params[:code])
-
     render :json => token.to_json
   end
 
@@ -633,12 +689,6 @@ class PseudonymSessionsController < ApplicationController
     render :json => {}
   end
 
-  def final_oauth2_redirect_params(options = {})
-    options = {:scopes => session[:oauth2][:scopes], :remember_access => options[:remember_access]}
-    code = Canvas::Oauth::Token.generate_code_for(@current_user.global_id, session[:oauth2][:client_id], options)
-    redirect_params = { :code => code }
-  end
-
   def final_oauth2_redirect(redirect_uri, opts = {})
     if Canvas::Oauth::Provider.is_oob?(redirect_uri)
       redirect_to oauth2_auth_url(opts)
@@ -646,7 +696,5 @@ class PseudonymSessionsController < ApplicationController
       has_params = redirect_uri =~ %r{\?}
       redirect_to(redirect_uri + (has_params ? "&" : "?") + opts.to_query)
     end
-
-    session.delete(:oauth2)
   end
 end
